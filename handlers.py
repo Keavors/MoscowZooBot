@@ -1,218 +1,245 @@
 from telebot import types
-import logging
-
-from app import bot
+from telebot.apihelper import ApiException
+from bot_instance import bot
 from data.animals import ANIMALS
 from data.questions import QUESTIONS
-from keyboards import create_keyboard, restart_keyboard, share_keyboard, contact_keyboard, feedback_keyboard
+from keyboards import create_keyboard
 from utils import calculate_result, update_scores
+import logging
 
 # Настройка логирования
-logging.basicConfig(filename='bot.log', level=logging.INFO,
-                    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+logging.basicConfig(
+    filename='bot.log',
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
 
 # Словарь для хранения данных пользователей
 user_data = {}
 
 
-def start_handler(bot, message):
-    """Обработчик команды /start с логированием и обработкой ошибок"""
+def register_handlers():
+    """Регистрация всех обработчиков"""
+    # 1. Обработчик команды /start
+    bot.message_handler(commands=['start'])(start_handler)
+
+    # 2. Обработчик ответов на вопросы викторины
+    bot.message_handler(func=lambda message: is_user_in_quiz(message))(process_answer)
+
+    # 3. Обработчик inline-кнопок
+    bot.callback_query_handler(func=lambda call: True)(handle_callback)
+
+    # 4. Fallback для остальных сообщений
+    bot.message_handler(func=lambda message: True)(fallback_handler)
+
+
+def is_user_in_quiz(message) -> bool:
+    """Проверяет, находится ли пользователь в процессе викторины"""
+    user_id = message.chat.id
+    return (
+            user_id in user_data and
+            user_data[user_id].get("question_index", 0) < len(QUESTIONS)
+    )
+
+def start_handler(message):
+    """Обработчик команды /start"""
     try:
         user_id = message.chat.id
         user_data[user_id] = {
             "score": {animal: 0 for animal in ANIMALS},
             "question_index": 0,
-            "feedback": None
+            "excluded_animals": set(),
+            "feedback": None,
+            "result_animal": None  # Сохраняем результат для шаринга
         }
 
         bot.send_message(
             user_id,
-            "🐾 Привет! Я помогу тебе найти твоё тотемное животное Московского зоопарка!\n"
-            "Ответь на 10 вопросов, и я подберу тебе идеального питомца-опекуна!\n\n"
-            "Начнём? Жми на кнопки ответов! 🦁"
+            "🐾 Добро пожаловать в викторину Московского зоопарка!\n"
+            "Ответьте на 10 вопросов, чтобы узнать ваше тотемное животное.\n\n"
+            "Начнём? Выбирайте варианты ответов! 🦁"
         )
-        ask_question(bot, user_id)
+        ask_question(user_id)
         logging.info(f"User {user_id} started quiz")
 
     except Exception as e:
-        logging.error(f"Error in start_handler: {e}", exc_info=True)
-        bot.send_message(message.chat.id, "⚠️ Что-то пошло не так. Попробуйте позже.")
+        logging.error(f"Start error: {e}", exc_info=True)
+        bot.send_message(message.chat.id, "⚠️ Произошла ошибка. Попробуйте /start")
 
-
-def ask_question(bot, user_id):
-    """Задаёт следующий вопрос с проверкой прогресса"""
+def ask_question(user_id):
+    """Задаёт следующий вопрос"""
     try:
         if user_data[user_id]["question_index"] >= len(QUESTIONS):
-            show_result(bot, user_id)
+            show_result(user_id)
             return
 
-        question_data = QUESTIONS[user_data[user_id]["question_index"]]
-        progress = f"Вопрос {user_data[user_id]['question_index'] + 1}/{len(QUESTIONS)}"
+        question_index = user_data[user_id]["question_index"]
+        question_data = QUESTIONS[question_index]
 
-        msg = bot.send_message(
+        # Создаем клавиатуру с вариантами ответов
+        markup = create_keyboard([option["text"] for option in question_data["options"]])
+        progress = f"Вопрос {question_index + 1}/{len(QUESTIONS)}"
+
+        bot.send_message(
             user_id,
             f"📌 {progress}\n{question_data['question']}",
-            reply_markup=create_keyboard(question_data["options"])
+            reply_markup=markup
         )
-        bot.register_next_step_handler(msg, lambda m: handle_answer(bot, m))
 
     except Exception as e:
-        logging.error(f"Error asking question: {e}", exc_info=True)
+        logging.error(f"Ask question error: {e}", exc_info=True)
         bot.send_message(user_id, "⚠️ Ошибка загрузки вопроса. Попробуйте /start")
 
+def process_answer(message):
+    """Обработка ответа пользователя"""
+    user_id = message.chat.id
+    if user_id not in user_data:
+        bot.send_message(user_id, "🌀 Пожалуйста, начните викторину заново: /start")
+        return
 
-def handle_answer(bot, message):
-    """Обработка ответов с валидацией и подсчётом баллов"""
+    current_index = user_data[user_id]["question_index"]
     try:
-        user_id = message.chat.id
+        current_question = QUESTIONS[current_index]
+    except IndexError:
+        bot.send_message(user_id, "⚠️ Ошибка загрузки вопроса. Попробуйте /start")
+        return
 
-        if user_id not in user_data:
-            bot.send_message(user_id, "🌀 Начни викторину заново: /start")
-            return
+    # Нормализация текста ответа
+    user_answer = message.text.strip().lower()
+    options = {
+        opt["text"].strip().lower(): opt
+        for opt in current_question["options"]
+    }
 
-        # Проверка валидности ответа
-        current_question = QUESTIONS[user_data[user_id]["question_index"]]
-        if message.text not in current_question["options"]:
-            bot.send_message(user_id, "🚫 Пожалуйста, выбери вариант из предложенных кнопок!")
-            ask_question(bot, user_id)
-            return
-
-        # Обновление баллов
-        user_data[user_id]["score"] = update_scores(
-            user_data[user_id]["score"],
-            current_question["weights"]
+    if user_answer not in options:
+        print(options, user_answer)
+        error_msg = (
+            "🚫 Пожалуйста, используйте кнопки для ответа.\n"
+            f"Доступные варианты: {', '.join([opt['text'] for opt in current_question['options']])}"
         )
+        bot.send_message(user_id, error_msg)
+        return ask_question(user_id)
 
-        user_data[user_id]["question_index"] += 1
-        ask_question(bot, user_id)
+    # Получаем выбранный вариант
+    selected_option = options[user_answer]
 
-    except Exception as e:
-        logging.error(f"Error handling answer: {e}", exc_info=True)
-        bot.send_message(message.chat.id, "⚠️ Ошибка обработки ответа. Попробуйте /start")
+    # Обновляем данные пользователя
+    user_data[user_id]["excluded_animals"].update(selected_option["excludes"])
+    user_data[user_id]["score"] = update_scores(
+        user_data[user_id]["score"],
+        selected_option["weights"]
+    )
+    user_data[user_id]["question_index"] += 1
 
+    ask_question(user_id)
 
-def show_result(bot, user_id):
-    """Показ результата с дополнительными опциями"""
+def show_result(user_id):
+    """Показывает итоговый результат"""
     try:
-        result_animal = calculate_result(user_data[user_id]["score"])
+        total_score = sum(user_data[user_id]["score"].values())
+        excluded = user_data[user_id]["excluded_animals"]
+        result_animal = calculate_result(total_score, excluded)
+        user_data[user_id]["result_animal"] = result_animal  # Сохраняем для шаринга
         animal_data = ANIMALS[result_animal]
 
-        # Формирование описания
-        description = (
-            f"🎉 Твоё тотемное животное — *{result_animal}*!\n\n"
+        caption = (
+            f"🎉 Ваше тотемное животное — *{result_animal}*!\n\n"
             f"{animal_data['description']}\n\n"
-            f"🐾 Хочешь взять под опеку этого красавца? "
-            f"Переходи на [сайт программы]({animal_data['opeka_link']})!"
+            f"🐾 Узнать о программе опеки: [ссылка]({animal_data['opeka_link']})"
         )
 
-        # Отправка результата
         bot.send_photo(
             user_id,
             animal_data['image'],
-            caption=description,
+            caption=caption,
             parse_mode='Markdown',
             reply_markup=types.ReplyKeyboardRemove()
         )
 
-        # Панель действий после викторины
         markup = types.InlineKeyboardMarkup()
         markup.row(
-            types.InlineKeyboardButton("🔄 Пройти ещё раз", callback_data="restart"),
+            types.InlineKeyboardButton("🔄 Пройти снова", callback_data="restart"),
             types.InlineKeyboardButton("📤 Поделиться", callback_data="share")
         )
         markup.row(
             types.InlineKeyboardButton("📝 Оставить отзыв", callback_data="feedback"),
-            types.InlineKeyboardButton("📞 Связаться с куратором", callback_data="contact")
+            types.InlineKeyboardButton("📞 Контакты", callback_data="contact")
         )
 
-        bot.send_message(
-            user_id,
-            "👇 Что ты хочешь сделать дальше?",
-            reply_markup=markup
-        )
+        bot.send_message(user_id, "👇 Выберите дальнейшее действие:", reply_markup=markup)
 
-        # Очистка данных пользователя (кроме отзыва)
-        del user_data[user_id]['score']
-        del user_data[user_id]['question_index']
+        # Очистка временных данных (кроме result_animal для шаринга)
+        keys_to_delete = ['score', 'question_index', 'excluded_animals']
+        for key in keys_to_delete:
+            user_data[user_id].pop(key, None)
 
     except Exception as e:
-        logging.error(f"Error showing result: {e}", exc_info=True)
+        logging.error(f"Result error: {e}", exc_info=True)
         bot.send_message(user_id, "⚠️ Ошибка показа результата. Попробуйте /start")
 
-
-def handle_callback(bot, call):
+def handle_callback(call):
     """Обработчик inline-кнопок"""
     try:
         user_id = call.message.chat.id
+        data = call.data
 
-        if call.data == "restart":
-            start_handler(bot, call.message)
+        if data == "restart":
+            user_data.pop(user_id, None)  # Полная очистка данных
+            start_handler(call.message)
 
-        elif call.data == "share":
-            result_animal = calculate_result(user_data.get(user_id, {}).get("score", {}))
+        elif data == "share":
+            animal = user_data.get(user_id, {}).get("result_animal", "животное")
             share_text = (
-                f"Моё тотемное животное Московского зоопарка — {result_animal}! 🐯\n"
-                f"Пройди викторину и узнай своё: https://t.me/your_bot_name"
+                f"Моё тотемное животное Московского зоопарка — {animal}! 🦁\n"
+                "Пройди викторину и узнай своё: @MoscowZooBot"
             )
-            bot.send_message(
-                user_id,
-                f"📲 Вот твоя ссылка для分享:\n\n{share_text}",
-                reply_markup=types.ReplyKeyboardRemove()
-            )
+            bot.send_message(user_id, f"📩 Для публикации:\n\n{share_text}")
 
-        elif call.data == "feedback":
-            msg = bot.send_message(user_id, "📝 Напиши свой отзыв или предложение:")
+        elif data == "feedback":
+            msg = bot.send_message(user_id, "✍️ Напишите ваш отзыв или предложение:")
             bot.register_next_step_handler(msg, save_feedback)
 
-        elif call.data == "contact":
-            result_animal = calculate_result(user_data.get(user_id, {}).get("score", {}))
-            contact_info = (
-                "📩 Для связи с куратором программы опеки:\n\n"
-                f"*Результат вашей викторины:* {result_animal}\n"
-                "✉️ Email: opeka@moscowzoo.ru\n"
-                "📞 Телефон: +7 (495) 777-77-77\n\n"
-                "Мы свяжемся с вами в течение 2 рабочих дней!"
+        elif data == "contact":
+            animal = user_data.get(user_id, {}).get("result_animal", "неизвестное животное")
+            contact_msg = (
+                "📬 Контакты для опеки:\n\n"
+                f"Ваше животное: {animal}\n"
+                "Email: opeka@moscowzoo.ru\n"
+                "Телефон: +7 (495) 777-77-77"
             )
-            bot.send_message(
-                user_id,
-                contact_info,
-                parse_mode='Markdown'
-            )
+            bot.send_message(user_id, contact_msg)
 
+    except ApiException as e:
+        logging.error(f"Callback API error: {e}")
     except Exception as e:
         logging.error(f"Callback error: {e}", exc_info=True)
         bot.send_message(user_id, "⚠️ Произошла ошибка. Попробуйте позже.")
 
-
 def save_feedback(message):
-    """Сохранение отзыва с модерацией"""
+    """Сохранение отзыва"""
     try:
         user_id = message.chat.id
-        feedback = message.text
+        feedback = message.text.strip()
 
         if len(feedback) < 10:
-            bot.send_message(user_id, "❌ Слишком короткий отзыв. Напиши хотя бы 10 символов.")
+            bot.send_message(user_id, "❌ Отзыв должен содержать минимум 10 символов")
             return
 
-        # Здесь можно добавить сохранение в БД или отправку на почту
-        user_data[user_id]["feedback"] = feedback
-        bot.send_message(
-            user_id,
-            "✅ Спасибо за отзыв! Мы обязательно его учтём!\n"
-            "Если ты оставил контактные данные, с тобой могут связаться."
-        )
-        logging.info(f"Feedback from {user_id}: {feedback[:50]}...")
+        if user_id in user_data:
+            user_data[user_id]["feedback"] = feedback
+
+        bot.send_message(user_id, "✅ Благодарим за обратную связь!")
+        logging.info(f"Feedback from {user_id}: {feedback[:100]}")
 
     except Exception as e:
-        logging.error(f"Feedback error: {e}", exc_info=True)
-        bot.send_message(user_id, "⚠️ Ошибка сохранения отзыва. Попробуйте позже.")
+        logging.error(f"Feedback save error: {e}", exc_info=True)
+        bot.send_message(user_id, "⚠️ Не удалось сохранить отзыв. Попробуйте позже.")
 
-
-def error_handler(bot, message):
-    """Глобальный обработчик ошибок"""
-    logging.error(f"Unhandled exception: {message}")
-    bot.send_message(
-        message.chat.id,
-        "🔧 Произошла непредвиденная ошибка. Мы уже работаем над исправлением!\n"
-        "Попробуйте начать заново: /start"
-    )
+def fallback_handler(message):
+    """Обработчик неподдерживаемых сообщений"""
+    user_id = message.chat.id
+    if message.text.startswith('/'):
+        bot.send_message(user_id, "⚠️ Неизвестная команда. Для начала викторины отправьте /start")
+    else:
+        print(1)
+        bot.send_message(user_id, "ℹ️ Пожалуйста, используйте кнопки для ответов")
