@@ -1,6 +1,6 @@
 from telebot import TeleBot
 from config import TOKEN
-from handlers import start_handler, handle_answer, restart_handler
+from handlers import start_handler, handle_answer, handle_callback
 
 # Инициализация бота
 bot = TeleBot(TOKEN)
@@ -14,10 +14,10 @@ def start(message):
 def answer(message):
     handle_answer(bot, message)
 
-@bot.message_handler(func=lambda message: message.text == "Попробовать ещё раз?")
-def restart(message):
-    restart_handler(bot, message)
+@bot.callback_query_handler(func=lambda call: True)
+def callback_handler(call):
+    handle_callback(bot, call)
 
 # Запуск бота
 if __name__ == "__main__":
-    bot.polling()
+    bot.polling(none_stop=True)
