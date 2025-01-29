@@ -1,5 +1,4 @@
 from telebot import types
-from telebot.apihelper import ApiException
 from bot_instance import bot
 from data.animals import ANIMALS
 from data.questions import QUESTIONS
@@ -14,32 +13,49 @@ logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
 )
 
-# Словарь для хранения данных пользователей
 user_data = {}
 
 
 def register_handlers():
-    """Регистрация всех обработчиков"""
-    # 1. Обработчик команды /start
+    """Регистрация обработчиков с приоритетом"""
     bot.message_handler(commands=['start'])(start_handler)
-
-    # 2. Обработчик ответов на вопросы викторины
-    bot.message_handler(func=lambda message: is_user_in_quiz(message))(process_answer)
-
-    # 3. Обработчик inline-кнопок
+    bot.message_handler(func=lambda msg: is_user_in_quiz(msg))(process_answer)
     bot.callback_query_handler(func=lambda call: True)(handle_callback)
-
-    # 4. Fallback для остальных сообщений
-    bot.message_handler(func=lambda message: True)(fallback_handler)
+    bot.message_handler(func=lambda msg: True)(fallback_handler)
 
 
 def is_user_in_quiz(message) -> bool:
-    """Проверяет, находится ли пользователь в процессе викторины"""
+    """Проверяет, активна ли викторина у пользователя"""
     user_id = message.chat.id
     return (
             user_id in user_data and
             user_data[user_id].get("question_index", 0) < len(QUESTIONS)
     )
+
+
+def fallback_handler(message):
+    """Обработчик всех сообщений, которые не попали в другие обработчики"""
+    user_id = message.chat.id
+    try:
+        if user_id in user_data and "result_animal" in user_data[user_id]:
+            # После завершения викторины
+            markup = types.InlineKeyboardMarkup()
+            markup.row(
+                types.InlineKeyboardButton("🔄 Пройти снова", callback_data="restart"),
+                types.InlineKeyboardButton("📞 Контакты", callback_data="contact")
+            )
+            bot.send_message(
+                user_id,
+                "🌀 Викторина завершена. Выберите действие:",
+                reply_markup=markup
+            )
+        else:
+            # До начала викторины
+            bot.send_message(user_id, "ℹ️ Начните викторину: /start")
+    except Exception as e:
+        logging.error(f"Fallback error: {e}")
+        bot.send_message(user_id, "⚠️ Неизвестная команда. Используйте /start")
+
 
 def start_handler(message):
     """Обработчик команды /start"""
@@ -47,10 +63,10 @@ def start_handler(message):
         user_id = message.chat.id
         user_data[user_id] = {
             "score": {animal: 0 for animal in ANIMALS},
-            "question_index": 0,
+            "question_index": 0,  # Обязательный ключ
             "excluded_animals": set(),
             "feedback": None,
-            "result_animal": None  # Сохраняем результат для шаринга
+            "result_animal": None
         }
 
         bot.send_message(
@@ -65,6 +81,7 @@ def start_handler(message):
     except Exception as e:
         logging.error(f"Start error: {e}", exc_info=True)
         bot.send_message(message.chat.id, "⚠️ Произошла ошибка. Попробуйте /start")
+
 
 def ask_question(user_id):
     """Задаёт следующий вопрос"""
@@ -90,48 +107,62 @@ def ask_question(user_id):
         logging.error(f"Ask question error: {e}", exc_info=True)
         bot.send_message(user_id, "⚠️ Ошибка загрузки вопроса. Попробуйте /start")
 
+
 def process_answer(message):
     """Обработка ответа пользователя"""
     user_id = message.chat.id
-    if user_id not in user_data:
-        bot.send_message(user_id, "🌀 Пожалуйста, начните викторину заново: /start")
-        return
-
-    current_index = user_data[user_id]["question_index"]
     try:
+        # Проверяем, зарегистрирован ли пользователь и есть ли данные
+        if user_id not in user_data:
+            bot.send_message(user_id, "🌀 Пожалуйста, начните викторину: /start")
+            return
+
+        # Проверяем наличие ключа 'question_index'
+        user_session = user_data[user_id]
+        if "question_index" not in user_session:
+            bot.send_message(user_id, "⚠️ Сессия повреждена. Начните заново: /start")
+            return
+
+        current_index = user_session["question_index"]
+
+        # Проверяем, не завершена ли викторина
+        if current_index >= len(QUESTIONS):
+            show_result(user_id)
+            return
+
+        # Получаем текущий вопрос
         current_question = QUESTIONS[current_index]
-    except IndexError:
-        bot.send_message(user_id, "⚠️ Ошибка загрузки вопроса. Попробуйте /start")
-        return
 
-    # Нормализация текста ответа
-    user_answer = message.text.strip().lower()
-    options = {
-        opt["text"].strip().lower(): opt
-        for opt in current_question["options"]
-    }
+        # Нормализация ответа
+        user_answer = message.text.strip().lower()
+        options = {
+            opt["text"].strip().lower(): opt
+            for opt in current_question["options"]
+        }
 
-    if user_answer not in options:
-        print(options, user_answer)
-        error_msg = (
-            "🚫 Пожалуйста, используйте кнопки для ответа.\n"
-            f"Доступные варианты: {', '.join([opt['text'] for opt in current_question['options']])}"
-        )
-        bot.send_message(user_id, error_msg)
-        return ask_question(user_id)
+        if user_answer not in options:
+            error_msg = (
+                "🚫 Используйте кнопки для ответа:\n"
+                f"{', '.join([opt['text'] for opt in current_question['options']])}"
+            )
+            bot.send_message(user_id, error_msg)
+            return ask_question(user_id)
 
-    # Получаем выбранный вариант
-    selected_option = options[user_answer]
+        # Обновляем данные
+        selected_option = options[user_answer]
+        user_session["excluded_animals"].update(selected_option["excludes"])
+        user_session["score"] = update_scores(user_session["score"], selected_option["weights"])
+        user_session["question_index"] += 1
 
-    # Обновляем данные пользователя
-    user_data[user_id]["excluded_animals"].update(selected_option["excludes"])
-    user_data[user_id]["score"] = update_scores(
-        user_data[user_id]["score"],
-        selected_option["weights"]
-    )
-    user_data[user_id]["question_index"] += 1
+        ask_question(user_id)
 
-    ask_question(user_id)
+    except KeyError as e:
+        logging.error(f"KeyError: {e} в процессе ответа пользователя {user_id}")
+        bot.send_message(user_id, "⚠️ Ошибка данных. Пожалуйста, начните заново: /start")
+    except Exception as e:
+        logging.error(f"Ошибка в process_answer: {e}", exc_info=True)
+        bot.send_message(user_id, "🌀 Произошла непредвиденная ошибка. Попробуйте /start")
+
 
 def show_result(user_id):
     """Показывает итоговый результат"""
@@ -177,6 +208,7 @@ def show_result(user_id):
         logging.error(f"Result error: {e}", exc_info=True)
         bot.send_message(user_id, "⚠️ Ошибка показа результата. Попробуйте /start")
 
+
 def handle_callback(call):
     """Обработчик inline-кнопок"""
     try:
@@ -209,11 +241,10 @@ def handle_callback(call):
             )
             bot.send_message(user_id, contact_msg)
 
-    except ApiException as e:
-        logging.error(f"Callback API error: {e}")
     except Exception as e:
         logging.error(f"Callback error: {e}", exc_info=True)
-        bot.send_message(user_id, "⚠️ Произошла ошибка. Попробуйте позже.")
+        bot.send_message(call.message.chat.id, "⚠️ Ошибка. Попробуйте ещё раз.")
+
 
 def save_feedback(message):
     """Сохранение отзыва"""
@@ -231,9 +262,11 @@ def save_feedback(message):
         bot.send_message(user_id, "✅ Благодарим за обратную связь!")
         logging.info(f"Feedback from {user_id}: {feedback[:100]}")
 
+
     except Exception as e:
-        logging.error(f"Feedback save error: {e}", exc_info=True)
-        bot.send_message(user_id, "⚠️ Не удалось сохранить отзыв. Попробуйте позже.")
+        logging.error(f"Feedback error: {e}")
+        bot.send_message(message.chat.id, "⚠️ Не удалось сохранить отзыв.")
+
 
 def fallback_handler(message):
     """Обработчик неподдерживаемых сообщений"""
